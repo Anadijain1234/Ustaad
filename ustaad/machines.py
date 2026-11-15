@@ -19,7 +19,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from . import config, llm, packs, store
+from . import config, llm, packs, reader, specs, store
 from .memory import manual_to_memory, memory, record_to_memory
 
 PAGE_WORDS = re.compile(r"alarm|trouble|fault|error|maint|lubric|specif|clean|filter|replac|inspect|warrant|daily|weekly|"
@@ -254,8 +254,21 @@ def save(industry, d, person_id=None, role_id=None):
            "specs": [s for s in (d.get("specs") or []) if isinstance(s, dict) and s.get("label")][:15],
            "components": comps, "service": _merge_service((existing or {}).get("service"), new_service),
            "source_ref": (d.get("source_ref") or "")[:300], "custom": is_new or bool((existing or {}).get("custom")),
-           "added_by": person_id or ""}
+           "added_by": person_id or "", "template": d.get("template") or (existing or {}).get("template") or "",
+           "spec_fields": _clean_fields(d.get("spec_fields")) or (existing or {}).get("spec_fields") or [],
+           "image": (d.get("image") or (existing or {}).get("image") or "")[:400],
+           **{k: (existing or {}).get(k) for k in ("report", "universal", "part_tree", "report_meta", "serial_no")
+              if (existing or {}).get(k)}}
     store.save_machine(industry, row, person_id or "")
+    b = reader.recall_bundle(d.get("read_id"))
+    if b:  # keep every page of the manual (bronze) and mark the ones used (silver) — for "ask the manual"
+        pages, size = [], 0
+        for pg in b["pages"]:
+            if pg["text"] and size < 400_000:
+                src_ref = b["sources"][pg["src"]]["ref"]
+                pages.append({"source": str(src_ref), "page": pg["n"], "text": pg["text"], "kept": pg.get("kept"), "via": pg["via"]})
+                size += len(pg["text"])
+        store.save_manual_pages(industry, aid, pages)
     # the manual's knowledge goes into memory (and Hindsight)
     mems = []
     src = row["source_ref"] or "Maker's manual"
@@ -274,10 +287,246 @@ def save(industry, d, person_id=None, role_id=None):
     if row["specs"] and (is_new or new_source):
         mems.append(store.add_manual_item(industry, aid, "spec", f"{row['name']} spec sheet",
                                           "; ".join(f"{s['label']}: {s['value']}" for s in row["specs"]), src))
+    for f in d.get("parts_found") or []:  # part numbers read from a parts list or drawing
+        if isinstance(f, dict) and f.get("name") and f.get("part_no") and len(mems) < 40:
+            mems.append(store.add_manual_item(industry, aid, "part", f"{f['name']} — part no. {f['part_no']}",
+                                              f"Spare part for {aid}: {f['name']}, part number {f['part_no']}.", src))
     where = memory.retain_many(industry, [manual_to_memory(industry, m) for m in mems]) if mems else "—"
+    if b or is_new:  # new manual or new machine -> the expert read starts in the background
+        from . import expert
+        expert.start(industry, aid)
     return {"asset": packs.asset(industry, aid), "manual_memories": len(mems), "saved_to": where,
             "message": (f"✔ {aid} added." if is_new else f"✔ {aid} updated.")
             + (f" {len(mems)} manual facts saved to memory." if mems else "")}
+
+
+def _clean_fields(fields):
+    out = []
+    for f in fields or []:
+        if isinstance(f, dict) and f.get("key") and str(f.get("value") or "").strip():
+            out.append({k: f.get(k) for k in ("key", "label", "unit", "value", "unit_given", "std", "status", "quote", "where", "note")})
+    return out[:30]
+
+
+# ---------- read anything + expert fill ----------
+def read_source(industry, url=None, file=None, text=None, pages=None, read_id=None, model=None):
+    """Paste a link, upload a PDF or a photo, or type text -> a checked draft for the 'add machine' form."""
+    b = reader.recall_bundle(read_id) if read_id else None
+    if b is None:
+        if file:
+            data, name, mime = file
+            if (mime or "").startswith("image/"):
+                import base64
+                b = reader.read_photo(base64.b64encode(data).decode(), mime, name)
+            else:
+                b = reader.read_pdf(data, f"PDF: {name}", pages)
+        elif url:
+            b = reader.read_url(url, pages_hint=pages)
+        elif (text or "").strip():
+            if len(text.strip()) < 40:
+                raise ValueError("Paste a bit more text, a link, or upload the manual.")
+            b = reader.read_text(text)
+        else:
+            raise ValueError("Paste a link, upload a PDF or photo, or type the details.")
+    ident = b.get("ident") or specs.identify(industry, b)
+    b["ident"] = ident
+    tpl, data = specs.extract(industry, b, ident, model)
+    check = specs.verify(b, tpl, data)
+    by_key = {f["key"]: f for f in check["fields"]}
+    spec_list = [{"label": f["label"], "value": specs.show(f)} for f in check["fields"] if f["value"]]
+    spec_list += [{"label": e["label"], "value": e["value"]} for e in check["extra"]]
+    src = b["sources"][0] if b["sources"] else {"ref": ""}
+    draft = _clean_draft(industry, {
+        "name": _nice_name(ident.get("model_family") or b.get("title") or "", tpl["label"], model or ident.get("exact_model") or ""),
+        "maker": ident.get("maker") or "",
+        "model": model or ident.get("exact_model") or "", "type": tpl["label"], "summary": ident.get("summary") or "",
+        "specs": spec_list, "components": data.get("components"), "faults": data.get("faults"), "service": data.get("service"),
+        "warranty_months": data.get("warranty_months"), "note": data.get("note", "")}, str(src.get("ref") or ""))
+    draft["specs"] = spec_list[:20]
+    parts_found = [{"name": x["name"].title(), "part_no": x["part_no"], "info": x.get("info", ""), "where": x["where"]}
+                   for x in b.get("parts") or []]
+    draft.update({"read_id": b["id"], "read": reader.summary(b), "template": tpl["key"], "template_label": tpl["label"],
+                  "spec_fields": check["fields"], "spec_extra": check["extra"], "spec_counts": check["counts"],
+                  "spec_score": check["score"], "models": ident.get("models") or [], "chosen_model": model or "",
+                  "image": reader.summary(b).get("image") or "", "parts_found": parts_found[:20],
+                  "shown": {k: specs.show(f) for k, f in by_key.items()}})
+    return draft
+
+
+GENERIC_TITLE = re.compile(r"^\W*(user'?s?|owner'?s?|operat\w*|instruction\w*|service|installation|maintenance|technical)?\s*"
+                           r"(manual|guide|handbook|instructions|datasheet|data sheet|spec(ification)?s?( sheet)?)\W*$|^typed in$", re.I)
+
+
+def _nice_name(name, kind, model):
+    """'USER MANUAL' (a cover page) is not a machine name: use 'Fryer 351FCPG30N' instead."""
+    name = re.sub(r"\s+", " ", name or "").strip()
+    if not name or GENERIC_TITLE.match(name) or len(name) > 70:
+        return " ".join(x for x in (kind if kind != "General" else "", model) if x) or name[:70]
+    return name
+
+
+def ask_manual(industry, aid, question):
+    """Answer from this machine's own manual pages, with the page number for every claim."""
+    import math
+    from collections import Counter
+    from .memory import _tokens
+    a = packs.asset(industry, aid)
+    if not a:
+        raise ValueError("Unknown item")
+    question = (question or "").strip()[:500]
+    if not question:
+        raise ValueError("Type a question about the manual")
+    pages = store.manual_pages(industry, aid)
+    if not pages:
+        raise ValueError(f"No manual stored for {aid} yet. Add one with ✏️ Edit details → PDF or web link.")
+    drawing = drawing_search(pages, question)
+    docs = [set(_tokens(p["text"])) for p in pages]
+    df = Counter(w for d in docs for w in d)
+    q = set(_tokens(question))
+    codes = {c for c in re.findall(r"\d{3,}", question)}
+    scored = []
+    for p, d in zip(pages, docs):
+        sc = sum(math.log(1 + len(docs) / df[w]) for w in q if w in d) + (6 if any(c in p["text"] for c in codes) else 0)
+        if sc > 0:
+            scored.append((sc, p))
+    top = [p for _, p in sorted(scored, key=lambda x: -x[0])[:4]]
+    hit_pages = {(h["source"], h["page"]) for h in drawing}
+    top = [p for p in pages if (p["source"], p["page"]) in hit_pages][:2] + [p for p in top if (p["source"], p["page"]) not in hit_pages]
+    top = top[:4]
+    if not top:
+        return {"answer": "The stored manual pages don't mention that. Try other words, or check the full manual.", "pages": [],
+                "refs": [], "drawing": [], "written_by": "search"}
+    refs = [{"page": p["page"], "src": _src_id(p["source"]), "label": f"{reader._short(p['source'])} p.{p['page']}"} for p in top]
+    cite = lambda p: f"{reader._short(p['source'])} p.{p['page']}"  # noqa: E731
+    ctx = "\n\n".join(f"[{cite(p)}]\n{p['text'][:2500]}" for p in top)
+    data = llm.chat_json(
+        "You answer a technician's question using ONLY the manual pages given. Cite the page for every fact like (p.45). "
+        "If the pages don't answer it, say so plainly. Short and practical. Never invent values.",
+        f"Machine: {aid} — {a.get('name', '')}\nQuestion: {question}\n\nMANUAL PAGES:\n{ctx}\n\n"
+        "Return ONLY JSON: {\"answer\": \"2-5 sentences with (p.N) citations\", \"steps\": [\"if it is a procedure\"]}",
+        max_tokens=900) if llm.available() else None
+    if isinstance(data, dict) and data.get("answer"):
+        return {"answer": data["answer"], "steps": data.get("steps") or [], "pages": [cite(p) for p in top], "refs": refs,
+                "drawing": drawing, "written_by": llm.last_provider or "AI"}
+    best = top[0]
+    snippet = re.sub(r"\s+", " ", best["text"])[:600]
+    return {"answer": f"From {cite(best)}: {snippet}…", "steps": [], "pages": [cite(p) for p in top], "refs": refs,
+            "drawing": drawing, "written_by": "search (no AI key)"}
+
+
+# ---------- drawings, pages, photo -> pages ----------
+TAG = re.compile(r"\b(?:[A-Z]{1,4}\d{1,4}[A-Z]?(?::\d{1,3})?|[A-Z]{2,5}-\d{1,4}[A-Z]?)\b")
+
+
+def _src_id(source):
+    import hashlib
+    return hashlib.md5((source or "").encode()).hexdigest()[:8]
+
+
+def drawing_search(pages, question):
+    """'Where is relay K1?' -> every page where the tag K1 appears (wiring diagrams, pipe drawings, parts drawings),
+    with the words around it. Works on drawings that have text, and on pages read by Sarvam Vision."""
+    tags = [t for t in dict.fromkeys(TAG.findall(question or "")) if not re.fullmatch(r"[A-Z]+\d{3,}", t) or ":" in t][:4]
+    tags += [t for t in re.findall(r"\b[A-Z]{1,3}\d{1,3}\b", question or "") if t not in tags][:2]
+    out = []
+    for t in tags:
+        pat = re.compile(r"(?<![A-Za-z0-9])" + re.escape(t) + r"(?![A-Za-z0-9])")
+        for p in pages:
+            m = pat.search(p["text"])
+            if not m:
+                continue
+            tag_count = len(TAG.findall(p["text"]))
+            ctx = re.sub(r"\s+", " ", p["text"][max(0, m.start() - 90): m.end() + 90]).strip()
+            out.append({"tag": t, "page": p["page"], "source": p["source"], "src": _src_id(p["source"]),
+                        "label": f"{reader._short(p['source'])} p.{p['page']}", "context": ctx,
+                        "drawing": tag_count >= 15, "times": len(pat.findall(p["text"]))})
+    out.sort(key=lambda h: (not h["drawing"], -h["times"]))
+    return out[:6]
+
+
+def manual_page(industry, aid, page, src=None):
+    pages = [p for p in store.manual_pages(industry, aid) if p["page"] == int(page) and (not src or _src_id(p["source"]) == src)]
+    if not pages:
+        raise ValueError("That page isn't stored for this machine")
+    p = pages[0]
+    return {"page": p["page"], "source": reader._short(p["source"]), "src": _src_id(p["source"]), "text": p["text"],
+            "via": p.get("via", "text")}
+
+
+def photo_pages(industry, aid, image_bytes, mime):
+    """A photo of a panel, label or part -> the manual pages that match it (Sarvam Vision reads the photo's text)."""
+    import base64
+    import math
+    from collections import Counter
+    from . import ocr
+    from .memory import _tokens
+    pages = store.manual_pages(industry, aid)
+    if not pages:
+        raise ValueError(f"No manual stored for {aid} yet")
+    text, by = (ocr.image_text(image_bytes, mime), "Sarvam Vision") if ocr.available() else (None, None)
+    if not text:
+        seen = llm.read_photo(base64.b64encode(image_bytes).decode(), mime, "machine part or panel")
+        text = " ".join([seen.get("what_i_see", "")] + seen.get("codes", []) + seen.get("readings", [])) if isinstance(seen, dict) else ""
+        by = "Groq vision (backup)" if text else None
+    if not text:
+        raise ValueError("Couldn't read any text in the photo — try a closer, sharper photo")
+    q = set(_tokens(text))
+    tags = set(TAG.findall(text)) | set(re.findall(r"\d{3,}", text))
+    docs = [set(_tokens(p["text"])) for p in pages]
+    df = Counter(w for d in docs for w in d)
+    scored = []
+    for p, d in zip(pages, docs):
+        sc = sum(math.log(1 + len(docs) / df[w]) for w in q if w in d) + 4 * sum(1 for t in tags if t in p["text"])
+        if sc > 0:
+            scored.append((sc, p))
+    top = [p for _, p in sorted(scored, key=lambda x: -x[0])[:3]]
+    return {"read": text[:400], "read_by": by,
+            "pages": [{"page": p["page"], "src": _src_id(p["source"]), "label": f"{reader._short(p['source'])} p.{p['page']}",
+                       "snippet": re.sub(r"\s+", " ", p["text"])[:220]} for p in top]}
+
+
+def similar(industry, a):
+    """Machines like this one: same kind, and the same maker / model family or close key specs."""
+    mine = {f["key"]: f for f in a.get("spec_fields") or []}
+    tkey = a.get("template") or specs.guess_type(a.get("type", ""), a.get("type_key"))
+    out = []
+    for o in packs.assets(industry):
+        if o["id"] == a["id"]:
+            continue
+        okey = o.get("template") or specs.guess_type(o.get("type", ""), o.get("type_key"))
+        if okey != tkey:
+            continue
+        why = []
+        if a.get("model") and o.get("model") == a.get("model"):
+            why.append("same model")
+        elif a.get("maker") and o.get("maker") and a["maker"].split()[0].lower() == o["maker"].split()[0].lower():
+            why.append(f"same maker ({o['maker']})")
+        theirs = {f["key"]: f for f in o.get("spec_fields") or []}
+        close = [mine[k]["label"] for k in mine if k in theirs and isinstance(mine[k].get("std"), (int, float))
+                 and isinstance(theirs[k].get("std"), (int, float)) and mine[k]["std"]
+                 and abs(mine[k]["std"] - theirs[k]["std"]) / abs(mine[k]["std"]) <= 0.15]
+        if len(close) >= 2:
+            why.append("close specs: " + ", ".join(close[:3]))
+        if why or not mine:
+            out.append({"id": o["id"], "name": o.get("name", ""), "site": o.get("site"), "why": "; ".join(why) or "same kind of machine"})
+    return out[:6]
+
+
+def service_ics(industry, aid):
+    a = packs.asset(industry, aid)
+    if not a:
+        raise ValueError("Unknown item")
+    now = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    ev = []
+    for i, x in enumerate(service_due(industry, a)):
+        d = x["next"].replace("-", "")
+        ev.append("\r\n".join(["BEGIN:VEVENT", f"UID:ustaad-{industry}-{aid}-{i}-{d}@ustaad", f"DTSTAMP:{now}",
+                                 f"DTSTART;VALUE=DATE:{d}", f"RRULE:FREQ=DAILY;INTERVAL={x['every_days']};COUNT=12",
+                                 f"SUMMARY:{aid}: {x['what'][:80]}",
+                                 f"DESCRIPTION:Every {x['every_days']} days. From Ustaad (My machines).",
+                                 "BEGIN:VALARM", "TRIGGER:-P1D", "ACTION:DISPLAY", "DESCRIPTION:Service due tomorrow", "END:VALARM",
+                                 "END:VEVENT"]))
+    return "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Ustaad//Service//EN", *ev, "END:VCALENDAR"]) + "\r\n"
 
 
 def _merge_service(old, new):
@@ -493,7 +742,17 @@ def profile(industry, aid):
             "stats": {"problems": len(recs), "fixed": sum(1 for r in recs if r["outcome"] == "fixed"),
                       "hours_lost": round(sum(r["downtime_minutes"] or 0 for r in recs) / 60, 1),
                       "last_problem": recs[-1]["datetime"][:10] if recs else None},
-            "sensor": sensor_state(industry, aid)}
+            "sensor": sensor_state(industry, aid), "similar": similar(industry, a),
+            "spec_fields": [{**f, "shown": specs.show(f)} for f in a.get("spec_fields") or []],
+            "manual_pages": len(store.manual_pages(industry, aid)), **_smart(industry, a)}
+
+
+def _smart(industry, a):
+    from . import diagnosis
+    lim = diagnosis.maker_limits(a)
+    return {"uptime": diagnosis.uptime(industry, a["id"]), "part_life": diagnosis.part_life(industry, a),
+            "hour_meter": (diagnosis.hour_meter(industry, a["id"]) or [None])[-1], "cost": diagnosis.cost_incidents(industry, a["id"], 5),
+            "maker_limits": {k: v["text"] for k, v in lim.items()}, "stop_reasons": diagnosis.STOP_REASONS}
 
 
 # ---------- sensors: auto-log and sensor-confirmed fixes ----------
@@ -522,18 +781,89 @@ def sensor_alert(industry, aid, reading):
         raise ValueError("Unknown item")
     existing = _open_sensor_log(industry, aid, hours=6)
     if existing:
-        return {"record": existing, "new": False, "message": f"Already logged as open issue {existing['id']}."}
+        st = store.meta_get(f"sensorlog:{existing['id']}") or {}
+        return {"record": existing, "new": False, "plan": st.get("plan"),
+                "message": f"Already logged as open issue {existing['id']}."}
     vib, temp = reading.get("vib"), reading.get("temp")
-    th = _thresholds()
+    th, lim = _limits(a)
     what = "High vibration" if vib is not None and float(vib) >= th["vib_warn"] else "High temperature"
+    plan = alert_plan(industry, a, what, reading, th)
+    limit_text = (lim.get("vib") if what == "High vibration" else lim.get("temp") or {}) or {}
     rec = store.add_record(industry, {
         "asset_id": aid, "person_id": "sensor", "problem": f"Sensor alert: {what.lower()}", "code": "",
-        "symptom": f"Sensor reading: vibration {vib} mm/s, temperature {temp} °C" + (f" at {reading['time']}" if reading.get("time") else ""),
+        "symptom": f"Sensor reading: vibration {vib} mm/s, temperature {temp} °C" + (f" at {reading['time']}" if reading.get("time") else "")
+                   + (f". Maker's limit: {limit_text['text']}" if limit_text.get("text") else ""),
         "cause": "", "action": "Auto-logged by the sensor — waiting for a technician", "outcome": "open",
         "status": "approved", "source": "sensor", "notes": "Created automatically when the sensor crossed its limit."})
-    store.meta_set(f"sensorlog:{rec['id']}", {"created": datetime.now().isoformat(timespec="minutes"), "reading": reading})
+    store.meta_set(f"sensorlog:{rec['id']}", {"created": datetime.now().isoformat(timespec="minutes"), "reading": reading, "plan": plan})
     memory.retain(industry, record_to_memory(industry, rec))
-    return {"record": rec, "new": True, "message": f"📝 Auto-logged as open issue {rec['id']} — the technician only adds what they did."}
+    who = plan["expert"]["name"].split()[0] if plan.get("expert") else None
+    return {"record": rec, "new": True, "plan": plan,
+            "message": f"📝 Auto-logged as open issue {rec['id']}" + (f" — {who} is the best person to call." if who else ".")}
+
+
+def alert_plan(industry, a, what, reading, th=None):
+    """🏭 The machine calls first: from the team's own records, guess what this alert usually is, who fixes it best,
+    and what worked last time — so the right person is called before the breakdown."""
+    th = th or _limits(a)[0]
+    keys = ("vibrat",) if what == "High vibration" else ("temp", "hot", "heat", "overheat", "thermal")
+    twins = {x["id"] for x in packs.assets(industry) if x.get("model") and x.get("model") == a.get("model")} | {a["id"]}
+    recs = [r for r in store.records(industry) if r["asset_id"] in twins and r["status"] != "rejected" and r.get("source") != "sensor"]
+    like = [r for r in recs if any(k in f"{r['problem']} {r.get('symptom', '')} {r.get('cause', '')}".lower() for k in keys)]
+    count = {}
+    for r in like:
+        count[r["problem"]] = count.get(r["problem"], 0) + 1
+    problem = max(count, key=count.get) if count else ""
+    # who to call: own fixes of this problem + fixes of theirs others reused, and someone at the same site counts double
+    score, own, reused = {}, {}, {}
+    for r in store.records(industry):
+        if r["status"] == "rejected" or r["outcome"] != "fixed" or (problem and r["problem"] != problem):
+            continue
+        for pid, bucket in ((r.get("person_id"), own), (r.get("credited_to"), reused)):
+            p = packs.person(industry, pid) if pid else None
+            if p:
+                bucket[pid] = bucket.get(pid, 0) + 1
+                score[pid] = score.get(pid, 0) + (2 if p.get("site") == a.get("site") else 1)
+    if score:
+        pid = max(score, key=score.get)
+        p = packs.person(industry, pid)
+        expert = {"person_id": pid, "name": p["name"], "role": p.get("role", ""), "fixes": own.get(pid, 0),
+                  "reused": reused.get(pid, 0), "about": problem}
+    else:
+        expert = best_expert(industry, a["id"])
+    fixed = [r for r in like if r["outcome"] == "fixed" and (not problem or r["problem"] == problem)]
+    last = fixed[-1] if fixed else None
+    p = packs.person(industry, expert["person_id"]) if expert else None
+    value = f"{reading.get('vib')} mm/s (limit {th['vib_warn']})" if what == "High vibration" else f"{reading.get('temp')} °C (limit {th['temp_warn']})"
+    nm = a.get("name", "")
+    nm = nm[len(a["id"]):].lstrip(" ·:—-") if nm.startswith(a["id"]) else nm
+    msg = (f"{expert['name'].split()[0]} ji, Ustaad alert: {a['id']} ({nm}) — {what.lower()}, {value}."
+           + (f" Last time this was '{problem}' and this worked: {last['action'][:120]}." if last else "")
+           + " Can you come and check before it breaks down?") if expert else ""
+    return {"what": what, "value": value, "likely_problem": problem, "expert": expert, "phone": (p or {}).get("phone"),
+            "last_fix": {"date": last["datetime"][:10], "action": last["action"], "asset_id": last["asset_id"]} if last else None,
+            "message": msg}
+
+
+def open_alerts(industry, hours=24):
+    """Machines that called in the last day and are still waiting for someone."""
+    out = []
+    for r in store.records(industry):
+        if r.get("source") != "sensor" or r["outcome"] != "open":
+            continue
+        st = store.meta_get(f"sensorlog:{r['id']}") or {}
+        try:
+            age = (datetime.now() - datetime.fromisoformat(st.get("created", ""))).total_seconds() / 60
+        except ValueError:
+            continue
+        if age > hours * 60:
+            continue
+        a = packs.asset(industry, r["asset_id"]) or {}
+        plan = st.get("plan") or alert_plan(industry, a, "High vibration" if "vibration" in r["problem"] else "High temperature",
+                                            st.get("reading") or {})
+        out.append({"id": r["id"], "asset_id": r["asset_id"], "name": a.get("name", ""), "minutes_ago": round(age),
+                    "reading": st.get("reading") or {}, **plan})
+    return sorted(out, key=lambda x: x["minutes_ago"])
 
 
 def close_sensor_log(industry, aid, outcome, person_id, action, cause, minutes, problem=None):
@@ -552,11 +882,30 @@ def close_sensor_log(industry, aid, outcome, person_id, action, cause, minutes, 
     return rec
 
 
-def sensor_reading(industry, aid, vib, temp):
-    """Live readings API (a factory's sensor gateway can post here). Three normal readings after a fix -> sensor-confirmed."""
-    if not packs.asset(industry, aid):
+def _limits(a):
+    """Default sensor limits, replaced by the maker's own limits when the manual gives them."""
+    from . import diagnosis
+    th, lim = dict(_thresholds()), diagnosis.maker_limits(a or {})
+    if lim.get("temp"):
+        th["temp_warn"] = lim["temp"]["max"]
+    if lim.get("vib"):
+        th["vib_warn"] = lim["vib"]["max"]
+    return th, lim
+
+
+def sensor_reading(industry, aid, vib, temp, hours=None):
+    """Live readings API (a factory's sensor gateway can post here). Three normal readings after a fix -> sensor-confirmed.
+    The limits are the maker's own when the manual gives them. An hour-meter value can come along too."""
+    a = packs.asset(industry, aid)
+    if not a:
         raise ValueError("Unknown item")
-    th = _thresholds()
+    th, lim = _limits(a)
+    if hours not in (None, ""):
+        from . import diagnosis
+        try:
+            diagnosis.log_hours(industry, aid, hours)
+        except ValueError:
+            pass
     key = f"readings:{industry}:{aid}"
     hist = (store.meta_get(key).get("last") or [])[-9:] + [{"vib": float(vib), "temp": float(temp),
                                                             "at": datetime.now().isoformat(timespec="seconds")}]
@@ -574,7 +923,8 @@ def sensor_reading(industry, aid, vib, temp):
     alert = None
     if hist[-1]["vib"] >= th["vib_warn"] or hist[-1]["temp"] >= th["temp_warn"]:
         alert = sensor_alert(industry, aid, {"vib": vib, "temp": temp})
-    return {"ok": True, "normal": normal, "confirmed_record": confirmed, "alert": alert}
+    return {"ok": True, "normal": normal, "confirmed_record": confirmed, "alert": alert,
+            "limits": {"temp": th["temp_warn"], "vib": th["vib_warn"], "from_maker": {k: v["text"] for k, v in lim.items()}}}
 
 
 def sensor_state(industry, aid):

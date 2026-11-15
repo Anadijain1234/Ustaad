@@ -3,6 +3,7 @@ SQLite store — the "scorebook". Exact copies of every work record, expert tip,
 for every industry. Hindsight is the memory that understands and searches; this store keeps the exact
 numbers for charts, Risk Radar, trust levels and the feedback loop. Fresh start = load the packs' seed data.
 """
+import hashlib
 import json
 import sqlite3
 import threading
@@ -31,6 +32,9 @@ CREATE TABLE IF NOT EXISTS asks (
 CREATE TABLE IF NOT EXISTS flags (memory_key TEXT PRIMARY KEY, industry TEXT, reason TEXT, flagged_by TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS machines (industry TEXT, id TEXT, data TEXT, created TEXT, created_by TEXT, PRIMARY KEY (industry, id));
+CREATE TABLE IF NOT EXISTS manual_pages (
+    id TEXT PRIMARY KEY, industry TEXT, asset_id TEXT, source TEXT, page INTEGER, text TEXT, kept INTEGER, via TEXT
+);
 CREATE TABLE IF NOT EXISTS manual_items (
     id TEXT PRIMARY KEY, industry TEXT, asset_id TEXT, kind TEXT, title TEXT, text TEXT, source_ref TEXT, date TEXT
 );
@@ -277,7 +281,7 @@ def meta_get(key):
 def meta_set(key, value):
     with _lock, _conn() as c:
         c.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, json.dumps(value)))
-    if key.split(":")[0] in ("sensor", "sensorlog", "readings"):
+    if key.split(":")[0] in ("sensor", "sensorlog", "readings", "bench", "stops", "hours", "ui", "guide", "guides", "network"):
         backup.mark_dirty()
 
 
@@ -288,3 +292,22 @@ def update_record(key, fields):
     with _lock, _conn() as c:
         c.execute(f"UPDATE records SET {', '.join(k + '=?' for k in allowed)} WHERE id=?", [*allowed.values(), key])
     backup.mark_dirty()
+
+
+# ---------- every page of a machine's manual (bronze) and which pages were used (silver) ----------
+def save_manual_pages(industry, asset_id, pages):
+    with _lock, _conn() as c:
+        for p in pages:
+            c.execute("INSERT OR REPLACE INTO manual_pages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (f"pg-{asset_id}-{hashlib.md5(p['source'].encode()).hexdigest()[:8]}-{p['page']}", industry, asset_id, p["source"][:300],
+                       int(p["page"]), p["text"][:12000], 1 if p.get("kept") else 0, p.get("via", "text")))
+    backup.mark_dirty()
+
+
+def manual_pages(industry, asset_id):
+    try:
+        with _conn() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM manual_pages WHERE industry=? AND asset_id=? ORDER BY source, page",
+                                               (industry, asset_id))]
+    except sqlite3.OperationalError:
+        return []

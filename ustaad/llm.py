@@ -1,8 +1,10 @@
 """
-Groq — the language model that writes Ustaad's answers, Whisper for voice, and a vision model for photos.
-
-If GROQ_API_KEY is missing or Groq fails, every caller has a rule-based fallback,
-so the app never shows an empty screen.
+The brains that write Ustaad's answers.
+  Default order:  Sarvam-105B writes  ->  Groq (gpt-oss-120b) is the backup  ->  rules, if no key at all.
+  WRITER=groq in the settings swaps Sarvam and Groq.
+  Bring your own brain: set BRAIN_URL / BRAIN_KEY / BRAIN_MODEL and that AI writes first (OpenAI, Gemini, Claude,
+  or a company's own model) — memory, maths, voice and translation stay exactly the same.
+Also here: Groq Whisper (last-resort ears), Groq vision (photo backup), Sarvam Bulbul (voice out).
 """
 import json
 import re
@@ -15,10 +17,13 @@ CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
 SARVAM = "https://api.sarvam.ai"
-LANG_CODES = {"en": "en-IN", "hi": "hi-IN", "kn": "kn-IN", "hinglish": "hi-IN"}
+def _lang():
+    from . import lang
+    return lang
 
 last_error = None
 last_provider = None
+last_model = None
 
 
 def groq_available():
@@ -29,9 +34,26 @@ def sarvam_available():
     return bool(config.SARVAM_API_KEY)
 
 
+def custom_available():
+    return bool(config.BRAIN_URL and config.BRAIN_MODEL)
+
+
+def custom_name():
+    return config.BRAIN_NAME or "Your own AI"
+
+
 def available():
-    """Is any language model available (Groq first, Sarvam as backup)?"""
-    return groq_available() or sarvam_available()
+    """Is any language model available to write?"""
+    return custom_available() or groq_available() or sarvam_available()
+
+
+def writers():
+    """Who writes, in order: [(name, model)]."""
+    out = [(custom_name(), config.BRAIN_MODEL)] if custom_available() else []
+    pair = [("Sarvam", config.SARVAM_CHAT_MODEL, sarvam_available()), ("Groq", config.GROQ_MODEL, groq_available())]
+    if config.WRITER == "groq":
+        pair.reverse()
+    return out + [(n, m) for n, m, ok in pair if ok]
 
 
 def _extract_json(text):
@@ -52,26 +74,70 @@ def _extract_json(text):
 
 
 def chat_json(system, user, max_tokens=1800):
-    """Ask for a JSON object: Groq first, then Sarvam-105B as backup. Returns a dict, or None."""
-    global last_provider
-    data = _groq_json(system, user, max_tokens) if groq_available() else None
-    if data is not None:
-        last_provider = "Groq"
-        return data
-    data = _sarvam_json(system, user, max_tokens) if sarvam_available() else None
-    if data is not None:
-        last_provider = "Sarvam (backup)"
-    return data
+    """Ask for a JSON object from the writers in order (your own AI -> Sarvam -> Groq). Returns a dict, or None."""
+    global last_provider, last_model
+    calls = {"Sarvam": lambda: _sarvam_json(system, user, max_tokens, timeout=config.SARVAM_WRITE_TIMEOUT),
+             "Groq": lambda: _groq_json(system, user, max_tokens)}
+    for i, (name, model) in enumerate(writers()):
+        fn = calls.get(name) or (lambda: _custom_json(system, user, max_tokens))
+        data = fn()
+        if data is not None:
+            last_provider = name if i == 0 else f"{name} (backup)"
+            last_model = model
+            return data
+    return None
 
 
-def _sarvam_json(system, user, max_tokens):
+def _custom_json(system, user, max_tokens=1800):
+    """Bring your own brain: any OpenAI-style chat endpoint (OpenAI, Gemini, Claude, Ollama, vLLM…)."""
+    global last_error
+    url = config.BRAIN_URL.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url += "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if config.BRAIN_KEY:
+        headers["Authorization"] = f"Bearer {config.BRAIN_KEY}"
+    base = {"model": config.BRAIN_MODEL, "temperature": 0.2, "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    for payload in ({**base, "response_format": {"type": "json_object"}}, base):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if r.status_code in (400, 422):
+                last_error = f"{custom_name()} {r.status_code}: {r.text[:200]}"
+                continue
+            r.raise_for_status()
+            data = _extract_json(r.json()["choices"][0]["message"].get("content") or "")
+            if data is not None:
+                return data
+            last_error = f"{custom_name()} returned text that was not JSON"
+        except Exception as e:
+            last_error = f"{custom_name()} error: {e}"
+            break
+    return None
+
+
+def chat_json_via(first, system, user, max_tokens=1800):
+    """Like chat_json, but start with a chosen brain ("groq" or "sarvam") so two can work side by side.
+    Returns (data, provider)."""
+    order = [("groq", groq_available, _groq_json), ("sarvam", sarvam_available, _sarvam_json)]
+    if first == "sarvam":
+        order.reverse()
+    for name, ok, fn in order:
+        if ok():
+            data = fn(system, user, max_tokens)
+            if data is not None:
+                return data, ("Groq" if name == "groq" else "Sarvam")
+    return None, None
+
+
+def _sarvam_json(system, user, max_tokens, timeout=90):
     global last_error
     headers = {"api-subscription-key": config.SARVAM_API_KEY, "Content-Type": "application/json"}
     base = {"model": config.SARVAM_CHAT_MODEL, "temperature": 0.2, "max_tokens": max(max_tokens, 2500),
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     for payload in ({**base, "response_format": {"type": "json_object"}, "reasoning_effort": "low"}, base):
         try:
-            r = requests.post(f"{SARVAM}/v1/chat/completions", headers=headers, json=payload, timeout=90)
+            r = requests.post(f"{SARVAM}/v1/chat/completions", headers=headers, json=payload, timeout=timeout)
             if r.status_code in (400, 422):
                 last_error = f"Sarvam {r.status_code}: {r.text[:200]}"
                 continue
@@ -99,6 +165,14 @@ def _groq_json(system, user, max_tokens=1800):
     for payload in attempts:
         try:
             r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=60)
+            if r.status_code == 429:  # free-tier rate limit: wait once (as long as Groq asks, max 20 s), then retry
+                import time
+                try:
+                    wait = float(r.headers.get("retry-after") or 8)
+                except ValueError:
+                    wait = 8
+                time.sleep(min(max(wait, 1), 20))
+                r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=60)
             if r.status_code == 400:
                 last_error = f"Groq 400: {r.text[:200]}"
                 continue
@@ -115,41 +189,34 @@ def _groq_json(system, user, max_tokens=1800):
     return None
 
 
-def transcribe(audio_bytes, filename="voice.webm", language=None):
-    """Voice -> text. Sarvam Saaras first (built for Indian languages and mixed speech), Groq Whisper as backup.
-    Returns (text, engine) or (None, None)."""
-    global last_error
-    if sarvam_available():
-        try:
-            r = requests.post(f"{SARVAM}/speech-to-text", headers={"api-subscription-key": config.SARVAM_API_KEY},
-                              files={"file": (filename, audio_bytes)},
-                              data={"model": config.SARVAM_STT_MODEL, "language_code": LANG_CODES.get(language, "unknown")},
-                              timeout=60)
-            r.raise_for_status()
-            text = (r.json().get("transcript") or "").strip()
-            if text:
-                return text, "Sarvam Saaras"
-        except Exception as e:
-            last_error = f"Sarvam speech-to-text error: {e}"
-    text = _whisper(audio_bytes, filename, {"hi": "hi", "kn": "kn", "en": "en", "hinglish": "hi"}.get(language))
-    return (text, "Groq Whisper") if text else (None, None)
+def transcribe(audio_bytes, filename="voice.webm", language=None, mime="", industry=None):
+    """Kept for old callers: the real pipeline (Sarvam -> Google -> Groq) is in voice.py."""
+    from . import voice
+    r = voice.transcribe(audio_bytes, filename, mime, language, industry)
+    return (r["text"], r["engine"]) if r["text"] else (None, None)
 
 
-def _whisper(audio_bytes, filename="voice.webm", language=None):
+def whisper(audio_bytes, filename="voice.webm", language=None):
+    """Groq Whisper: the last-resort ear (weak on Indian languages, so it is only used when Sarvam and Google fail)."""
     global last_error
     if not groq_available():
         return None
     data = {"model": config.GROQ_WHISPER_MODEL, "response_format": "json", "temperature": "0"}
-    if language:
+    if language in ("hi", "kn", "en", "ta", "te", "mr", "bn", "gu", "ml", "pa"):
         data["language"] = language
+    elif language == "hinglish":
+        data["language"] = "hi"
     try:
         r = requests.post(STT_URL, headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
-                          files={"file": (filename, audio_bytes)}, data=data, timeout=60)
+                          files={"file": (filename, audio_bytes)}, data=data, timeout=20)
         r.raise_for_status()
         return r.json().get("text", "").strip()
     except Exception as e:
         last_error = f"Groq speech-to-text error: {e}"
         return None
+
+
+_whisper = whisper
 
 
 def vision_json(prompt, image_b64, mime="image/jpeg", max_tokens=900):
@@ -195,7 +262,7 @@ def speak(text, language="en"):
     try:
         r = requests.post(f"{SARVAM}/text-to-speech",
                           headers={"api-subscription-key": config.SARVAM_API_KEY, "Content-Type": "application/json"},
-                          json={"text": text[:2400], "language_code": LANG_CODES.get(language, "en-IN"),
+                          json={"text": text[:2400], "language_code": _lang().SARVAM_CODE.get(language, "en-IN"),
                                 "model": config.SARVAM_TTS_MODEL, "pace": 1.0},
                           timeout=60)
         r.raise_for_status()
@@ -207,27 +274,6 @@ def speak(text, language="en"):
 
 
 def sarvam_translate(texts, language):
-    """Translate a list of short strings with Sarvam (simple, spoken-style words). Returns list or None."""
-    global last_error
-    if not sarvam_available():
-        return None
-    from concurrent.futures import ThreadPoolExecutor
-    target = LANG_CODES.get(language, "hi-IN")
-    extra = {"output_script": "roman"} if language == "hinglish" else {}
-
-    def one(t):
-        if not (t or "").strip():
-            return t
-        r = requests.post(f"{SARVAM}/translate",
-                          headers={"api-subscription-key": config.SARVAM_API_KEY, "Content-Type": "application/json"},
-                          json={"input": t[:990], "source_language_code": "auto", "target_language_code": target,
-                                "model": config.SARVAM_TRANSLATE_MODEL, "mode": "modern-colloquial", **extra},
-                          timeout=45)
-        r.raise_for_status()
-        return r.json().get("translated_text") or t
-    try:
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            return list(ex.map(one, texts))
-    except Exception as e:
-        last_error = f"Sarvam translate error: {e}"
-        return None
+    """Kept for old callers: translation now lives in lang.py (codes and numbers are protected there)."""
+    from . import lang
+    return lang.translate_texts(texts, language)

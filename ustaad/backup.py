@@ -60,8 +60,9 @@ def export():
             "tips": rows("SELECT * FROM tips WHERE COALESCE(source, 'seed') != 'seed'"),
             "machines": rows("SELECT * FROM machines"),
             "manual_items": rows("SELECT * FROM manual_items"),
+            "manual_pages": rows("SELECT * FROM manual_pages"),
             "flags": rows("SELECT * FROM flags"),
-            "meta": [r for r in rows("SELECT * FROM meta") if r["key"].split(":")[0] in ("sensor", "sensorlog", "readings")],
+            "meta": [r for r in rows("SELECT * FROM meta") if r["key"].split(":")[0] in ("sensor", "sensorlog", "readings", "bench", "stops", "hours", "ui", "guide", "guides", "network")],
         }
     d = config.CUSTOM_PACKS_DIR
     data["custom_packs"] = {p.name: p.read_text(encoding="utf-8") for p in sorted(d.glob("custom-*.json"))} if d.exists() else {}
@@ -81,6 +82,7 @@ def _apply(data):
     tables = {"records": store.REC_FIELDS, "tips": store.TIP_FIELDS,
               "machines": ["industry", "id", "data", "created", "created_by"],
               "manual_items": ["id", "industry", "asset_id", "kind", "title", "text", "source_ref", "date"],
+              "manual_pages": ["id", "industry", "asset_id", "source", "page", "text", "kept", "via"],
               "flags": ["memory_key", "industry", "reason", "flagged_by", "created"], "meta": ["key", "value"]}
     with store._lock, store._conn() as c:
         for table, cols in tables.items():

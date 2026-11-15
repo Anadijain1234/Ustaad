@@ -37,6 +37,17 @@ SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3").strip()
 SARVAM_TRANSLATE_MODEL = os.getenv("SARVAM_TRANSLATE_MODEL", "mayura:v1").strip()
 SARVAM_CHAT_MODEL = os.getenv("SARVAM_CHAT_MODEL", "sarvam-105b").strip()
 
+# --- Who writes the answers. Default: Sarvam writes, Groq is the backup (WRITER=groq swaps them). ---
+WRITER = os.getenv("WRITER", "sarvam").strip().lower()
+SARVAM_WRITE_TIMEOUT = float(os.getenv("SARVAM_WRITE_TIMEOUT", "45"))  # slower than this -> Groq takes over
+
+# --- Bring your own brain (optional): any AI that accepts OpenAI-style chat requests —
+# OpenAI, Gemini, Claude, or a company's own model (Ollama / vLLM on its own server). If set, it writes first. ---
+BRAIN_URL = os.getenv("BRAIN_URL", "").strip()      # e.g. https://api.openai.com/v1
+BRAIN_KEY = os.getenv("BRAIN_KEY", "").strip()
+BRAIN_MODEL = os.getenv("BRAIN_MODEL", "").strip()  # e.g. gpt-4o-mini, gemini-2.5-flash, llama3.1
+BRAIN_NAME = os.getenv("BRAIN_NAME", "").strip()    # how it is shown in the app, e.g. "ChatGPT"
+
 # --- Where it runs. On Vercel the project folder is read-only and instances stop when idle:
 # keep the database and new custom industries in /tmp, and save memories before replying. ---
 ON_VERCEL = bool(os.getenv("VERCEL"))
